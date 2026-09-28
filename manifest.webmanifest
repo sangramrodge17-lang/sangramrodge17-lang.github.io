@@ -1,0 +1,11 @@
+{
+  "name": "Tally Accounting Tool",
+  "short_name": "Tally Tool",
+  "description": "Private, local-only TallyPrime voucher preparation utility.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#06101c",
+  "theme_color": "#06101c",
+  "orientation": "any",
+  "categories": ["business", "productivity", "finance"]
+}
