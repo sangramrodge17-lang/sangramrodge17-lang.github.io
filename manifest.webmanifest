@@ -7,5 +7,29 @@
   "background_color": "#06101c",
   "theme_color": "#06101c",
   "orientation": "any",
-  "categories": ["business", "productivity", "finance"]
+  "categories": [
+    "business",
+    "productivity",
+    "finance"
+  ],
+  "id": "/",
+  "scope": "/",
+  "display_override": [
+    "window-controls-overlay",
+    "standalone"
+  ],
+  "icons": [
+    {
+      "src": "/icons/tally-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/tally-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
 }
