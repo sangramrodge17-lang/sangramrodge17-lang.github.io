@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v3-capital-gain";
+const CACHE_NAME = "tally-accounting-tool-shell-v4-capital-gain";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
