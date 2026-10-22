@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v7-red-flags";
+const CACHE_NAME = "tally-accounting-tool-shell-v8-date-calendar";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
