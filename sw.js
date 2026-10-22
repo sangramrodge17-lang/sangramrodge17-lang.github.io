@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v8-date-calendar";
+const CACHE_NAME = "tally-accounting-tool-shell-v9-raw-excel-dates";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
