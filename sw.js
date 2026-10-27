@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v17-direct-corrected-reco";
+const CACHE_NAME = "tally-accounting-tool-shell-v18-bank-corrected-preview";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
