@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v22-backup-merge";
+const CACHE_NAME = "tally-accounting-tool-shell-v23-tally-backup-zip";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
