@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v28-balance-fields";
+const CACHE_NAME = "tally-accounting-tool-shell-v29-explicit-ledger-collection";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
