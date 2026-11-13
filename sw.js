@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v29-explicit-ledger-collection";
+const CACHE_NAME = "tally-accounting-tool-shell-v30-report-diagnostics";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
