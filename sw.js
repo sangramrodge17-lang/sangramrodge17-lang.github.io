@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v26-suvit-protocol";
+const CACHE_NAME = "tally-accounting-tool-shell-v27-ledger-chat";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
