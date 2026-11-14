@@ -1,5 +1,6 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v36-dedicated-port";
-const SHELL = ["/"];
+const CACHE_NAME = "tally-accounting-tool-shell-v37-ledger-preview";
+const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
+const SHELL = [BASE_PATH];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL)));
@@ -22,6 +23,6 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/")))
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match(BASE_PATH)))
   );
 });
