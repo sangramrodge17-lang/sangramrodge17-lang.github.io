@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v31-version-fix";
+const CACHE_NAME = "tally-accounting-tool-shell-v32-controlled-write";
 const SHELL = ["/"];
 
 self.addEventListener("install", (event) => {
