@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v42-ledger-name-parser";
+const CACHE_NAME = "tally-accounting-tool-shell-v43-ledger-excel-export";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
