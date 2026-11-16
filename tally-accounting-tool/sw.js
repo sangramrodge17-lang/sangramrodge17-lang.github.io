@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v40-local-gemini";
+const CACHE_NAME = "tally-accounting-tool-shell-v41-structured-ledger";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
