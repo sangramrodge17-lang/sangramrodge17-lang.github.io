@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v55-model3-category-fix";
+const CACHE_NAME = "tally-accounting-tool-shell-v56-model3-planner-safety";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
