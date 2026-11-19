@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v62-nexa-copilot-ui";
+const CACHE_NAME = "tally-accounting-tool-shell-v63-nexa-fuzzy-reports";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
