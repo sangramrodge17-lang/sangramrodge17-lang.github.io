@@ -62,7 +62,9 @@ var ENV = {
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  firebaseProjectId: process.env.FIREBASE_PROJECT_ID ?? "tally-ai-985e9",
+  model2GeminiApiKey: process.env.FIREBASE_MODEL2_GEMINI_API_KEY ?? ""
 };
 
 // server/db.ts
@@ -218,8 +220,8 @@ var SDKServer = class {
     this.client = client;
     this.oauthService = new OAuthService(this.client);
   }
-  deriveLoginMethod(platforms, fallback) {
-    if (fallback && fallback.length > 0) return fallback;
+  deriveLoginMethod(platforms, fallback2) {
+    if (fallback2 && fallback2.length > 0) return fallback2;
     if (!Array.isArray(platforms) || platforms.length === 0) return null;
     const set = new Set(
       platforms.filter((p) => typeof p === "string")
@@ -738,11 +740,77 @@ var financeRouter = router({
   })
 });
 
+// server/model2Router.ts
+import { z as z3 } from "zod";
+var inputSchema = z3.object({
+  question: z3.string().min(1).max(4e3),
+  context: z3.record(z3.string(), z3.unknown()).optional()
+});
+var responseSchema = {
+  type: "object",
+  properties: {
+    answer: { type: "string" },
+    operation: { type: "string" },
+    needsConnector: { type: "boolean" },
+    clarification: { type: "string" }
+  },
+  required: ["answer", "operation", "needsConnector", "clarification"]
+};
+var fallback = (message) => ({
+  answer: message,
+  operation: "unavailable",
+  needsConnector: false,
+  clarification: ""
+});
+var model2Router = router({
+  chat: publicProcedure.input(inputSchema).mutation(async ({ input }) => {
+    const apiKey = process.env.FIREBASE_MODEL2_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey) return fallback("Model 2 is not configured yet. Add the server-side Gemini secret to the Firebase backend before using this workspace.");
+    const system = [
+      "You are Model 2, a backend-assisted TallyPrime accounting operator.",
+      "This is a separate model from the existing Tally Interaction Chat and must never claim that Tally was changed.",
+      "Understand natural language, identify the likely Tally operation, and ask one concise clarification when the request is ambiguous.",
+      "Never invent accounting values. If live Tally rows are not supplied, say that the local connector must retrieve them.",
+      "For any write request, prepare only a reviewable voucher plan; explicit user approval is required before posting."
+    ].join(" ");
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${encodeURIComponent(apiKey)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: JSON.stringify({ question: input.question, context: input.context || {} }) }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 700, responseMimeType: "application/json", responseSchema }
+      })
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      if (response.status === 401 || response.status === 403) {
+        return fallback("Model 2 is connected to its backend, but the server-side Gemini credential is invalid or missing. Add a valid key to the Firebase backend secret; the browser key field is not used by this model.");
+      }
+      return fallback(`Model 2 backend is temporarily unavailable (${response.status}). No Tally data was retrieved or changed.`);
+    }
+    const payload = await response.json();
+    const text2 = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
+    try {
+      const parsed = JSON.parse(text2);
+      return {
+        answer: parsed.answer || "I need more detail before I can prepare a Tally operation.",
+        operation: parsed.operation || "clarification",
+        needsConnector: parsed.needsConnector !== false,
+        clarification: parsed.clarification || ""
+      };
+    } catch {
+      return fallback("Model 2 returned an unreadable plan. Please retry with the ledger, period, and report or voucher you need.");
+    }
+  })
+});
+
 // server/routers.ts
 var appRouter = router({
   // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
   system: systemRouter,
   finance: financeRouter,
+  model2: model2Router,
   auth: router({
     me: publicProcedure.query((opts) => opts.ctx.user),
     logout: publicProcedure.mutation(({ ctx }) => {
