@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v58-model3-summary-chat";
+const CACHE_NAME = "tally-accounting-tool-shell-v59-model3-gemini-normalization";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
