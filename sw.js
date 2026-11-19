@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v64-model3-connector-download";
+const CACHE_NAME = "tally-accounting-tool-shell-v65-model3-fullwidth-copilot";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
