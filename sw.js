@@ -1,4 +1,4 @@
-const CACHE_NAME = "tally-accounting-tool-shell-v66-supabase-linked";
+const CACHE_NAME = "tally-accounting-tool-v56-tally-accounting-tool-shell-v53-local-query-engine";
 const BASE_PATH = self.registration.scope.endsWith("/tally-accounting-tool/") ? "/tally-accounting-tool/" : "/";
 const SHELL = [BASE_PATH];
 
