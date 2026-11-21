@@ -68,6 +68,38 @@ public static class SyncStore
         }
     }
 
+    public static object QuerySnapshotChunk(string kind, int offset, int limit, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        using var db = Open(path);
+        var safeKind = (kind ?? "").Trim().ToLowerInvariant();
+        var table = safeKind switch { "ledgers" => "ledger", "vouchers" => "voucher", "entries" => "entry", _ => "company" };
+        var total = ScalarInt(db, $"SELECT COUNT(*) FROM {table}");
+        offset = Math.Max(0, offset);
+        limit = Math.Clamp(limit, 1, 500);
+        var rows = new List<object>();
+        using var command = db.CreateCommand();
+        command.CommandText = table switch
+        {
+            "ledger" => "SELECT guid,name,parent,alias,opening,closing,gstin,pan,alterid FROM ledger ORDER BY name LIMIT $limit OFFSET $offset",
+            "voucher" => "SELECT guid,masterid,alterid,date,vtype,number,party,narration,is_cancelled,is_optional,raw_xml FROM voucher ORDER BY date,guid LIMIT $limit OFFSET $offset",
+            "entry" => "SELECT e.voucher_guid,e.line_no,e.ledger,e.amount,e.is_party FROM entry e JOIN voucher v ON v.guid=e.voucher_guid ORDER BY v.date,e.voucher_guid,e.line_no LIMIT $limit OFFSET $offset",
+            _ => "SELECT guid,name,books_from,synced_at FROM company ORDER BY synced_at DESC LIMIT $limit OFFSET $offset",
+        };
+        command.Parameters.AddWithValue("$limit", limit);
+        command.Parameters.AddWithValue("$offset", offset);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (table == "ledger") rows.Add(new { guid = reader.GetString(0), name = reader.GetString(1), parent = reader.IsDBNull(2) ? "" : reader.GetString(2), alias = reader.IsDBNull(3) ? "" : reader.GetString(3), opening = reader.IsDBNull(4) ? 0m : reader.GetDecimal(4), closing = reader.IsDBNull(5) ? 0m : reader.GetDecimal(5), gstin = reader.IsDBNull(6) ? "" : reader.GetString(6), pan = reader.IsDBNull(7) ? "" : reader.GetString(7), alterId = reader.IsDBNull(8) ? (long?)null : reader.GetInt64(8) });
+            else if (table == "voucher") rows.Add(new { tallyGuid = reader.GetString(0), masterId = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1), alterId = reader.IsDBNull(2) ? (long?)null : reader.GetInt64(2), voucherDate = reader.IsDBNull(3) ? "" : reader.GetString(3), voucherType = reader.IsDBNull(4) ? "" : reader.GetString(4), voucherNumber = reader.IsDBNull(5) ? "" : reader.GetString(5), party = reader.IsDBNull(6) ? "" : reader.GetString(6), narration = reader.IsDBNull(7) ? "" : reader.GetString(7), isCancelled = !reader.IsDBNull(8) && reader.GetInt32(8) != 0, isOptional = !reader.IsDBNull(9) && reader.GetInt32(9) != 0, rawXml = reader.IsDBNull(10) ? "" : reader.GetString(10) });
+            else if (table == "entry") rows.Add(new { voucherGuid = reader.GetString(0), lineNo = reader.IsDBNull(1) ? 0 : reader.GetInt32(1), ledgerName = reader.IsDBNull(2) ? "" : reader.GetString(2), amount = reader.IsDBNull(3) ? 0m : reader.GetDecimal(3), isParty = !reader.IsDBNull(4) && reader.GetInt32(4) != 0 });
+            else rows.Add(new { tallyGuid = reader.GetString(0), name = reader.GetString(1), booksFrom = reader.IsDBNull(2) ? "" : reader.GetString(2), syncedAt = reader.IsDBNull(3) ? "" : reader.GetString(3) });
+        }
+        return new { kind = safeKind.Length == 0 ? "company" : safeKind, offset, limit, total, rows = rows.ToArray(), store = GetStatus(path) };
+    }
+
     public static SyncSummary UpsertVoucherXml(string xml, string company, string from, string to, string? databasePath = null)
     {
         var path = databasePath ?? DefaultPath;

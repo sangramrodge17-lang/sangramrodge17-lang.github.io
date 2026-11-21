@@ -170,6 +170,15 @@ async Task HandleAsync(HttpListenerContext context)
         return;
     }
 
+    if (path == "/api/sync/model3/snapshot")
+    {
+        var kind = context.Request.QueryString["kind"]?.Trim() ?? "company";
+        var offset = int.TryParse(context.Request.QueryString["offset"], out var parsedOffset) ? parsedOffset : 0;
+        var limit = int.TryParse(context.Request.QueryString["limit"], out var parsedLimit) ? parsedLimit : 250;
+        await JsonAsync(context, 200, SyncStore.QuerySnapshotChunk(kind, offset, limit));
+        return;
+    }
+
     if (path == "/api/sync/model3/summary")
     {
         var kind = context.Request.QueryString["kind"]?.Trim() ?? "";
