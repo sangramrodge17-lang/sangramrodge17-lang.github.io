@@ -36,6 +36,7 @@ public static class SyncStore
             CREATE INDEX IF NOT EXISTS ix_e_v ON entry(voucher_guid);
             CREATE TABLE IF NOT EXISTS bill(voucher_guid TEXT NOT NULL, ledger TEXT, bill_name TEXT, bill_type TEXT, amount REAL, FOREIGN KEY(voucher_guid) REFERENCES voucher(guid) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS inventory(voucher_guid TEXT NOT NULL, item TEXT, qty TEXT, rate TEXT, amount REAL, godown TEXT, FOREIGN KEY(voucher_guid) REFERENCES voucher(guid) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS opening_bill(ledger TEXT NOT NULL, bill_name TEXT NOT NULL, bill_date TEXT, credit_period TEXT, due_date TEXT, amount REAL, PRIMARY KEY(ledger, bill_name));
             CREATE VIEW IF NOT EXISTS ledger_statement AS
             SELECT e.ledger, v.date, v.vtype, v.number, v.narration,
                    CASE WHEN e.amount < 0 THEN -e.amount ELSE 0 END AS debit,
@@ -45,6 +46,106 @@ public static class SyncStore
             WHERE v.is_cancelled = 0 AND v.is_optional = 0;
             """;
         cmd.ExecuteNonQuery();
+        // Additive migrations for databases created by older connector versions.
+        AddColumnIfMissing(db, "ledger", "group_path", "TEXT");
+        AddColumnIfMissing(db, "ledger", "is_msme", "INTEGER");
+        AddColumnIfMissing(db, "ledger", "udyam_no", "TEXT");
+        AddColumnIfMissing(db, "ledger", "msme_category", "TEXT");
+        AddColumnIfMissing(db, "ledger", "credit_days", "INTEGER");
+        AddColumnIfMissing(db, "bill", "credit_period", "TEXT");
+        AddColumnIfMissing(db, "bill", "due_date", "TEXT");
+    }
+
+    private static void AddColumnIfMissing(SqliteConnection db, string table, string column, string type)
+    {
+        using (var info = db.CreateCommand())
+        {
+            info.CommandText = $"PRAGMA table_info({table})";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+                if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return;
+        }
+        using var alter = db.CreateCommand();
+        alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {type}";
+        alter.ExecuteNonQuery();
+    }
+
+    // One row per voucher/ledger/bill reference: voucher bill allocations plus ledger-master opening bills.
+    // Amount sign follows Tally: debit negative, credit positive (same as entries).
+    private const string BillsSnapshotSql = """
+        SELECT g AS voucher_guid, MAX(vdate) AS voucher_date, ledger, bill_name, bill_type, MAX(bill_date) AS bill_date, MAX(due_date) AS due_date, SUM(amount) AS amount
+        FROM (
+            SELECT b.voucher_guid AS g, v.date AS vdate, b.ledger AS ledger, b.bill_name AS bill_name, COALESCE(b.bill_type,'') AS bill_type,
+                   CASE WHEN lower(COALESCE(b.bill_type,'')) LIKE 'new%' THEN v.date END AS bill_date, b.due_date AS due_date, b.amount AS amount
+            FROM bill b JOIN voucher v ON v.guid = b.voucher_guid
+            WHERE v.is_cancelled = 0 AND v.is_optional = 0 AND COALESCE(b.bill_name,'') <> '' AND COALESCE(b.ledger,'') <> ''
+            UNION ALL
+            SELECT 'opening:' || ledger, NULL, ledger, bill_name, 'New Ref', bill_date, due_date, amount FROM opening_bill
+        )
+        GROUP BY g, ledger, bill_name, bill_type
+        """;
+
+    public sealed record LedgerEnrichment(string Name, string? GroupPath, string? Gstin, string? Pan, bool? IsMsme, string? UdyamNo, string? MsmeCategory, int? CreditDays);
+    public sealed record OpeningBill(string Ledger, string BillName, string? BillDate, string? CreditPeriod, string? DueDate, decimal Amount);
+
+    public static int ApplyLedgerEnrichment(IEnumerable<LedgerEnrichment> rows, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        using var db = Open(path);
+        using var tx = db.BeginTransaction();
+        var updated = 0;
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.Name)) continue;
+            using var cmd = db.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE ledger SET group_path=COALESCE($gp,group_path), gstin=COALESCE($gst,gstin), pan=COALESCE($pan,pan), is_msme=COALESCE($msme,is_msme), udyam_no=COALESCE($udyam,udyam_no), msme_category=COALESCE($cat,msme_category), credit_days=COALESCE($cd,credit_days) WHERE guid=$g";
+            cmd.Parameters.AddWithValue("$gp", (object?)row.GroupPath ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$gst", (object?)row.Gstin ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$pan", (object?)row.Pan ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$msme", row.IsMsme is null ? (object)DBNull.Value : (row.IsMsme.Value ? 1 : 0));
+            cmd.Parameters.AddWithValue("$udyam", (object?)row.UdyamNo ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$cat", (object?)row.MsmeCategory ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$cd", row.CreditDays is null ? (object)DBNull.Value : row.CreditDays.Value);
+            cmd.Parameters.AddWithValue("$g", $"name:{row.Name.Trim().ToUpperInvariant()}");
+            updated += cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+        return updated;
+    }
+
+    public static int ReplaceOpeningBills(IEnumerable<OpeningBill> bills, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        using var db = Open(path);
+        using var tx = db.BeginTransaction();
+        Exec(db, tx, "DELETE FROM opening_bill");
+        var count = 0;
+        foreach (var bill in bills)
+        {
+            Exec(db, tx, "INSERT OR REPLACE INTO opening_bill(ledger,bill_name,bill_date,credit_period,due_date,amount) VALUES($l,$b,$d,$c,$due,$a)",
+                ("$l", bill.Ledger), ("$b", bill.BillName), ("$d", bill.BillDate ?? (object)DBNull.Value), ("$c", bill.CreditPeriod ?? (object)DBNull.Value), ("$due", bill.DueDate ?? (object)DBNull.Value), ("$a", bill.Amount));
+            count++;
+        }
+        tx.Commit();
+        return count;
+    }
+
+    // "45 Days", "45", "6 weeks", "2 months" or an explicit date, counted from isoStart (yyyy-MM-dd).
+    internal static string? ComputeDueDate(string? isoStart, string? credit)
+    {
+        if (string.IsNullOrWhiteSpace(credit) || !DateTime.TryParseExact(isoStart ?? "", "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var start)) return null;
+        var text = credit.Trim();
+        var m = Regex.Match(text, @"^(\d{1,4})\s*(day|days|d)?$", RegexOptions.IgnoreCase);
+        if (m.Success) return start.AddDays(int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        m = Regex.Match(text, @"^(\d{1,3})\s*week", RegexOptions.IgnoreCase);
+        if (m.Success) return start.AddDays(7 * int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        m = Regex.Match(text, @"^(\d{1,3})\s*month", RegexOptions.IgnoreCase);
+        if (m.Success) return start.AddMonths(int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        string[] formats = { "yyyyMMdd", "d-MMM-yy", "dd-MMM-yyyy", "d-MMM-yyyy", "yyyy-MM-dd" };
+        return DateTime.TryParseExact(text, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out var explicitDate) ? explicitDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : null;
     }
 
     public static SyncStoreStatus GetStatus(string? databasePath = null)
@@ -74,15 +175,18 @@ public static class SyncStore
         EnsureCreated(path);
         using var db = Open(path);
         var safeKind = (kind ?? "").Trim().ToLowerInvariant();
-        var table = safeKind switch { "ledgers" => "ledger", "vouchers" => "voucher", "entries" => "entry", _ => "company" };
-        var total = ScalarInt(db, $"SELECT COUNT(*) FROM {table}");
+        var table = safeKind switch { "ledgers" => "ledger", "vouchers" => "voucher", "entries" => "entry", "bills" => "bills", _ => "company" };
+        var total = table == "bills"
+            ? ScalarInt(db, $"SELECT COUNT(*) FROM ({BillsSnapshotSql})")
+            : ScalarInt(db, $"SELECT COUNT(*) FROM {table}");
         offset = Math.Max(0, offset);
         limit = Math.Clamp(limit, 1, 500);
         var rows = new List<object>();
         using var command = db.CreateCommand();
         command.CommandText = table switch
         {
-            "ledger" => "SELECT guid,name,parent,alias,opening,closing,gstin,pan,alterid FROM ledger ORDER BY name LIMIT $limit OFFSET $offset",
+            "ledger" => "SELECT guid,name,parent,alias,opening,closing,gstin,pan,alterid,group_path,is_msme,udyam_no,msme_category,credit_days FROM ledger ORDER BY name LIMIT $limit OFFSET $offset",
+            "bills" => $"{BillsSnapshotSql} ORDER BY 1,3,4,5 LIMIT $limit OFFSET $offset",
             "voucher" => "SELECT guid,masterid,alterid,date,vtype,number,party,narration,is_cancelled,is_optional,raw_xml FROM voucher ORDER BY date,guid LIMIT $limit OFFSET $offset",
             "entry" => "SELECT e.voucher_guid,e.line_no,e.ledger,e.amount,e.is_party FROM entry e JOIN voucher v ON v.guid=e.voucher_guid ORDER BY v.date,e.voucher_guid,e.line_no LIMIT $limit OFFSET $offset",
             _ => "SELECT guid,name,books_from,synced_at FROM company ORDER BY synced_at DESC LIMIT $limit OFFSET $offset",
@@ -92,7 +196,8 @@ public static class SyncStore
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            if (table == "ledger") rows.Add(new { guid = reader.GetString(0), name = reader.GetString(1), parent = reader.IsDBNull(2) ? "" : reader.GetString(2), alias = reader.IsDBNull(3) ? "" : reader.GetString(3), opening = reader.IsDBNull(4) ? 0m : reader.GetDecimal(4), closing = reader.IsDBNull(5) ? 0m : reader.GetDecimal(5), gstin = reader.IsDBNull(6) ? "" : reader.GetString(6), pan = reader.IsDBNull(7) ? "" : reader.GetString(7), alterId = reader.IsDBNull(8) ? (long?)null : reader.GetInt64(8) });
+            if (table == "ledger") rows.Add(new { guid = reader.GetString(0), name = reader.GetString(1), parent = reader.IsDBNull(2) ? "" : reader.GetString(2), alias = reader.IsDBNull(3) ? "" : reader.GetString(3), opening = reader.IsDBNull(4) ? 0m : reader.GetDecimal(4), closing = reader.IsDBNull(5) ? 0m : reader.GetDecimal(5), gstin = reader.IsDBNull(6) ? "" : reader.GetString(6), pan = reader.IsDBNull(7) ? "" : reader.GetString(7), alterId = reader.IsDBNull(8) ? (long?)null : reader.GetInt64(8), groupPath = reader.IsDBNull(9) ? "" : reader.GetString(9), isMsme = reader.IsDBNull(10) ? (bool?)null : reader.GetInt32(10) != 0, udyamNo = reader.IsDBNull(11) ? "" : reader.GetString(11), msmeCategory = reader.IsDBNull(12) ? "" : reader.GetString(12), creditDays = reader.IsDBNull(13) ? (int?)null : reader.GetInt32(13) });
+            else if (table == "bills") rows.Add(new { voucherGuid = reader.GetString(0), voucherDate = reader.IsDBNull(1) ? null : reader.GetString(1), ledgerName = reader.GetString(2), billName = reader.GetString(3), billType = reader.IsDBNull(4) ? "" : reader.GetString(4), billDate = reader.IsDBNull(5) ? null : reader.GetString(5), dueDate = reader.IsDBNull(6) ? null : reader.GetString(6), amount = reader.IsDBNull(7) ? 0m : reader.GetDecimal(7) });
             else if (table == "voucher") rows.Add(new { tallyGuid = reader.GetString(0), masterId = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1), alterId = reader.IsDBNull(2) ? (long?)null : reader.GetInt64(2), voucherDate = reader.IsDBNull(3) ? "" : reader.GetString(3), voucherType = reader.IsDBNull(4) ? "" : reader.GetString(4), voucherNumber = reader.IsDBNull(5) ? "" : reader.GetString(5), party = reader.IsDBNull(6) ? "" : reader.GetString(6), narration = reader.IsDBNull(7) ? "" : reader.GetString(7), isCancelled = !reader.IsDBNull(8) && reader.GetInt32(8) != 0, isOptional = !reader.IsDBNull(9) && reader.GetInt32(9) != 0, rawXml = reader.IsDBNull(10) ? "" : reader.GetString(10) });
             else if (table == "entry") rows.Add(new { voucherGuid = reader.GetString(0), lineNo = reader.IsDBNull(1) ? 0 : reader.GetInt32(1), ledgerName = reader.IsDBNull(2) ? "" : reader.GetString(2), amount = reader.IsDBNull(3) ? 0m : reader.GetDecimal(3), isParty = !reader.IsDBNull(4) && reader.GetInt32(4) != 0 });
             else rows.Add(new { tallyGuid = reader.GetString(0), name = reader.GetString(1), booksFrom = reader.IsDBNull(2) ? "" : reader.GetString(2), syncedAt = reader.IsDBNull(3) ? "" : reader.GetString(3) });
@@ -141,8 +246,11 @@ public static class SyncStore
                 entryCount++;
                 foreach (var bill in entry.Elements().Where(x => x.Name.LocalName.Equals("BILLALLOCATIONS.LIST", StringComparison.OrdinalIgnoreCase)))
                 {
-                    Exec(db, tx, "INSERT INTO bill(voucher_guid,ledger,bill_name,bill_type,amount) VALUES($g,$l,$b,$t,$a)",
-                        ("$g", guid), ("$l", ledger), ("$b", Value(bill, "NAME")), ("$t", Value(bill, "BILLTYPE")), ("$a", Amount(Value(bill, "AMOUNT"))));
+                    var creditPeriod = Value(bill, "BILLCREDITPERIOD");
+                    var dueDate = ComputeDueDate(IsoDate(Value(voucher, "DATE")), creditPeriod);
+                    Exec(db, tx, "INSERT INTO bill(voucher_guid,ledger,bill_name,bill_type,amount,credit_period,due_date) VALUES($g,$l,$b,$t,$a,$cp,$dd)",
+                        ("$g", guid), ("$l", ledger), ("$b", Value(bill, "NAME")), ("$t", Value(bill, "BILLTYPE")), ("$a", Amount(Value(bill, "AMOUNT"))),
+                        ("$cp", creditPeriod), ("$dd", dueDate ?? (object)DBNull.Value));
                     billCount++;
                 }
             }

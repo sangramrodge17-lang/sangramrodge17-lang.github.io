@@ -6,7 +6,7 @@ using System.Xml.Linq;
 
 const int connectorPort = 17891;
 const int defaultTallyPort = 9000;
-const string connectorVersion = "2.14.5-model3-full-period-sync";
+const string connectorVersion = "2.15.0-model3-brain-sync";
 var tallyPort = int.TryParse(Environment.GetEnvironmentVariable("TALLY_PORT"), out var configuredPort)
     ? configuredPort
     : defaultTallyPort;
@@ -411,6 +411,19 @@ async Task<object> SyncModel3Async(SyncRequest request)
     {
         stages.Add(new { stage = "Master synchronization", status = "warning", detail = ex.Message, rows = 0 });
         warnings.Add($"Master synchronization warning: {ex.Message}");
+    }
+
+    // Best-effort enrichment (group paths, GST/PAN, MSME/Udyam, opening bills). It must never stop the proven sync below.
+    try
+    {
+        var enrichment = await LedgerEnricher.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
+        stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = enrichment.Status, detail = enrichment.Detail, rows = enrichment.Updated });
+        if (enrichment.Warning is not null) warnings.Add(enrichment.Warning);
+    }
+    catch (Exception ex)
+    {
+        stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = "warning", detail = ex.Message, rows = 0 });
+        warnings.Add($"Ledger enrichment warning: {ex.Message}");
     }
 
     foreach (var category in new[] { "Sales", "Purchase", "Receipt", "Payment", "Journal", "Contra" })
@@ -970,6 +983,14 @@ static string VoucherCollectionXml(string? from, string? to, string? category = 
         <FETCH>LEDGERENTRIES.LIST</FETCH>
         <FETCH>LEDGERENTRIES.LIST.LEDGERNAME</FETCH>
         <FETCH>LEDGERENTRIES.LIST.AMOUNT</FETCH>
+        <FETCH>ALLLEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.NAME</FETCH>
+        <FETCH>ALLLEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLTYPE</FETCH>
+        <FETCH>ALLLEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.AMOUNT</FETCH>
+        <FETCH>ALLLEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLCREDITPERIOD</FETCH>
+        <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.NAME</FETCH>
+        <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLTYPE</FETCH>
+        <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.AMOUNT</FETCH>
+        <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLCREDITPERIOD</FETCH>
           </COLLECTION>
           {(string.IsNullOrWhiteSpace(category) ? "" : $"<SYSTEM TYPE=\"Formula\" NAME=\"Model3VoucherTypeFilter\">$$IsEqual:$VOUCHERTYPENAME:\"{System.Security.SecurityElement.Escape(category)}\"</SYSTEM>")}
     </TDLMESSAGE></TDL>
