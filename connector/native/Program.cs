@@ -6,7 +6,7 @@ using System.Xml.Linq;
 
 const int connectorPort = 17891;
 const int defaultTallyPort = 9000;
-const string connectorVersion = "2.15.0-model3-brain-sync";
+const string connectorVersion = "2.16.0-all-data-sync";
 var tallyPort = int.TryParse(Environment.GetEnvironmentVariable("TALLY_PORT"), out var configuredPort)
     ? configuredPort
     : defaultTallyPort;
@@ -464,6 +464,19 @@ async Task<object> SyncModel3Async(SyncRequest request)
             stages.Add(new { stage = "Voucher fallback collection", status = "failed", detail = ex.Message, rows = 0 });
             warnings.Add($"Broad voucher collection failed: {ex.Message}");
         }
+    }
+
+    // Best-effort raw capture of every master (cost centres, stock items, GST/TDS setup, payroll, ...). Never blocks the sync.
+    try
+    {
+        var objects = await ObjectCapture.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
+        stages.Add(new { stage = "Master capture (all objects)", status = objects.Status, detail = objects.Detail, rows = objects.Updated });
+        if (objects.Warning is not null) warnings.Add(objects.Warning);
+    }
+    catch (Exception ex)
+    {
+        stages.Add(new { stage = "Master capture (all objects)", status = "warning", detail = ex.Message, rows = 0 });
+        warnings.Add($"Master capture warning: {ex.Message}");
     }
 
     stages.Add(new { stage = "Reconciliation", status = voucherTotal > 0 ? "complete" : "warning", detail = $"Local normalized store contains {voucherTotal} voucher(s) from this run" });
@@ -991,6 +1004,25 @@ static string VoucherCollectionXml(string? from, string? to, string? category = 
         <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLTYPE</FETCH>
         <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.AMOUNT</FETCH>
         <FETCH>LEDGERENTRIES.LIST.BILLALLOCATIONS.LIST.BILLCREDITPERIOD</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.STOCKITEMNAME</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.BILLEDQTY</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.ACTUALQTY</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.RATE</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.AMOUNT</FETCH>
+        <FETCH>ALLINVENTORYENTRIES.LIST.BATCHALLOCATIONS.LIST.GODOWNNAME</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.STOCKITEMNAME</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.BILLEDQTY</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.ACTUALQTY</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.RATE</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.AMOUNT</FETCH>
+        <FETCH>INVENTORYENTRIES.LIST.BATCHALLOCATIONS.LIST.GODOWNNAME</FETCH>
+        <FETCH>PARTYGSTIN</FETCH>
+        <FETCH>PLACEOFSUPPLY</FETCH>
+        <FETCH>GSTREGISTRATIONTYPE</FETCH>
+        <FETCH>REFERENCE</FETCH>
+        <FETCH>EFFECTIVEDATE</FETCH>
           </COLLECTION>
           {(string.IsNullOrWhiteSpace(category) ? "" : $"<SYSTEM TYPE=\"Formula\" NAME=\"Model3VoucherTypeFilter\">$$IsEqual:$VOUCHERTYPENAME:\"{System.Security.SecurityElement.Escape(category)}\"</SYSTEM>")}
     </TDLMESSAGE></TDL>

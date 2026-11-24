@@ -37,6 +37,7 @@ public static class SyncStore
             CREATE TABLE IF NOT EXISTS bill(voucher_guid TEXT NOT NULL, ledger TEXT, bill_name TEXT, bill_type TEXT, amount REAL, FOREIGN KEY(voucher_guid) REFERENCES voucher(guid) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS inventory(voucher_guid TEXT NOT NULL, item TEXT, qty TEXT, rate TEXT, amount REAL, godown TEXT, FOREIGN KEY(voucher_guid) REFERENCES voucher(guid) ON DELETE CASCADE);
             CREATE TABLE IF NOT EXISTS opening_bill(ledger TEXT NOT NULL, bill_name TEXT NOT NULL, bill_date TEXT, credit_period TEXT, due_date TEXT, amount REAL, PRIMARY KEY(ledger, bill_name));
+            CREATE TABLE IF NOT EXISTS object_raw(kind TEXT NOT NULL, name TEXT NOT NULL, guid TEXT, alterid INTEGER, json TEXT NOT NULL, synced_at TEXT, PRIMARY KEY(kind, name));
             CREATE VIEW IF NOT EXISTS ledger_statement AS
             SELECT e.ledger, v.date, v.vtype, v.number, v.narration,
                    CASE WHEN e.amount < 0 THEN -e.amount ELSE 0 END AS debit,
@@ -133,6 +134,57 @@ public static class SyncStore
         return count;
     }
 
+    public static Dictionary<string, long?> GetObjectAlterIds(string kind, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        using var db = Open(path);
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "SELECT name, alterid FROM object_raw WHERE kind=$k";
+        cmd.Parameters.AddWithValue("$k", kind);
+        using var reader = cmd.ExecuteReader();
+        var map = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read()) map[reader.GetString(0)] = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1);
+        return map;
+    }
+
+    public static void UpsertObject(string kind, string name, string? guid, long? alterId, string json, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        using var db = Open(path);
+        using var tx = db.BeginTransaction();
+        Exec(db, tx, "INSERT OR REPLACE INTO object_raw(kind,name,guid,alterid,json,synced_at) VALUES($k,$n,$g,$a,$j,$s)",
+            ("$k", kind), ("$n", name), ("$g", guid ?? (object)DBNull.Value), ("$a", alterId is null ? (object)DBNull.Value : alterId.Value),
+            ("$j", json), ("$s", DateTimeOffset.UtcNow.ToString("O")));
+        tx.Commit();
+    }
+
+    public static int PruneObjects(string kind, IEnumerable<string> keepNames, string? databasePath = null)
+    {
+        var path = databasePath ?? DefaultPath;
+        EnsureCreated(path);
+        var keep = new HashSet<string>(keepNames, StringComparer.OrdinalIgnoreCase);
+        using var db = Open(path);
+        var existing = new List<string>();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT name FROM object_raw WHERE kind=$k";
+            cmd.Parameters.AddWithValue("$k", kind);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) existing.Add(reader.GetString(0));
+        }
+        using var tx = db.BeginTransaction();
+        var removed = 0;
+        foreach (var name in existing.Where(n => !keep.Contains(n)))
+        {
+            Exec(db, tx, "DELETE FROM object_raw WHERE kind=$k AND name=$n", ("$k", kind), ("$n", name));
+            removed++;
+        }
+        tx.Commit();
+        return removed;
+    }
+
     // "45 Days", "45", "6 weeks", "2 months" or an explicit date, counted from isoStart (yyyy-MM-dd).
     internal static string? ComputeDueDate(string? isoStart, string? credit)
     {
@@ -175,18 +227,20 @@ public static class SyncStore
         EnsureCreated(path);
         using var db = Open(path);
         var safeKind = (kind ?? "").Trim().ToLowerInvariant();
-        var table = safeKind switch { "ledgers" => "ledger", "vouchers" => "voucher", "entries" => "entry", "bills" => "bills", _ => "company" };
+        var table = safeKind switch { "ledgers" => "ledger", "vouchers" => "voucher", "entries" => "entry", "bills" => "bills", "inventory" => "inventory", "objects" => "object_raw", _ => "company" };
         var total = table == "bills"
             ? ScalarInt(db, $"SELECT COUNT(*) FROM ({BillsSnapshotSql})")
             : ScalarInt(db, $"SELECT COUNT(*) FROM {table}");
         offset = Math.Max(0, offset);
-        limit = Math.Clamp(limit, 1, 500);
+        limit = Math.Clamp(limit, 1, table == "object_raw" ? 100 : 500);
         var rows = new List<object>();
         using var command = db.CreateCommand();
         command.CommandText = table switch
         {
             "ledger" => "SELECT guid,name,parent,alias,opening,closing,gstin,pan,alterid,group_path,is_msme,udyam_no,msme_category,credit_days FROM ledger ORDER BY name LIMIT $limit OFFSET $offset",
             "bills" => $"{BillsSnapshotSql} ORDER BY 1,3,4,5 LIMIT $limit OFFSET $offset",
+            "inventory" => "SELECT i.voucher_guid, ROW_NUMBER() OVER (PARTITION BY i.voucher_guid ORDER BY i.rowid) AS line_no, v.date, v.vtype, v.number, v.party, i.item, i.qty, i.rate, i.amount, i.godown FROM inventory i JOIN voucher v ON v.guid=i.voucher_guid ORDER BY v.date, i.voucher_guid, line_no LIMIT $limit OFFSET $offset",
+            "object_raw" => "SELECT kind,name,guid,alterid,json FROM object_raw ORDER BY kind,name LIMIT $limit OFFSET $offset",
             "voucher" => "SELECT guid,masterid,alterid,date,vtype,number,party,narration,is_cancelled,is_optional,raw_xml FROM voucher ORDER BY date,guid LIMIT $limit OFFSET $offset",
             "entry" => "SELECT e.voucher_guid,e.line_no,e.ledger,e.amount,e.is_party FROM entry e JOIN voucher v ON v.guid=e.voucher_guid ORDER BY v.date,e.voucher_guid,e.line_no LIMIT $limit OFFSET $offset",
             _ => "SELECT guid,name,books_from,synced_at FROM company ORDER BY synced_at DESC LIMIT $limit OFFSET $offset",
@@ -198,6 +252,8 @@ public static class SyncStore
         {
             if (table == "ledger") rows.Add(new { guid = reader.GetString(0), name = reader.GetString(1), parent = reader.IsDBNull(2) ? "" : reader.GetString(2), alias = reader.IsDBNull(3) ? "" : reader.GetString(3), opening = reader.IsDBNull(4) ? 0m : reader.GetDecimal(4), closing = reader.IsDBNull(5) ? 0m : reader.GetDecimal(5), gstin = reader.IsDBNull(6) ? "" : reader.GetString(6), pan = reader.IsDBNull(7) ? "" : reader.GetString(7), alterId = reader.IsDBNull(8) ? (long?)null : reader.GetInt64(8), groupPath = reader.IsDBNull(9) ? "" : reader.GetString(9), isMsme = reader.IsDBNull(10) ? (bool?)null : reader.GetInt32(10) != 0, udyamNo = reader.IsDBNull(11) ? "" : reader.GetString(11), msmeCategory = reader.IsDBNull(12) ? "" : reader.GetString(12), creditDays = reader.IsDBNull(13) ? (int?)null : reader.GetInt32(13) });
             else if (table == "bills") rows.Add(new { voucherGuid = reader.GetString(0), voucherDate = reader.IsDBNull(1) ? null : reader.GetString(1), ledgerName = reader.GetString(2), billName = reader.GetString(3), billType = reader.IsDBNull(4) ? "" : reader.GetString(4), billDate = reader.IsDBNull(5) ? null : reader.GetString(5), dueDate = reader.IsDBNull(6) ? null : reader.GetString(6), amount = reader.IsDBNull(7) ? 0m : reader.GetDecimal(7) });
+            else if (table == "inventory") rows.Add(new { voucherGuid = reader.GetString(0), lineNo = reader.GetInt32(1), voucherDate = reader.IsDBNull(2) ? null : reader.GetString(2), voucherType = reader.IsDBNull(3) ? "" : reader.GetString(3), voucherNumber = reader.IsDBNull(4) ? "" : reader.GetString(4), party = reader.IsDBNull(5) ? "" : reader.GetString(5), item = reader.IsDBNull(6) ? "" : reader.GetString(6), qty = reader.IsDBNull(7) ? "" : reader.GetString(7), rate = reader.IsDBNull(8) ? "" : reader.GetString(8), amount = reader.IsDBNull(9) ? 0m : reader.GetDecimal(9), godown = reader.IsDBNull(10) ? "" : reader.GetString(10) });
+            else if (table == "object_raw") rows.Add(new { kind = reader.GetString(0), name = reader.GetString(1), guid = reader.IsDBNull(2) ? null : reader.GetString(2), alterId = reader.IsDBNull(3) ? (long?)null : reader.GetInt64(3), json = reader.GetString(4) });
             else if (table == "voucher") rows.Add(new { tallyGuid = reader.GetString(0), masterId = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1), alterId = reader.IsDBNull(2) ? (long?)null : reader.GetInt64(2), voucherDate = reader.IsDBNull(3) ? "" : reader.GetString(3), voucherType = reader.IsDBNull(4) ? "" : reader.GetString(4), voucherNumber = reader.IsDBNull(5) ? "" : reader.GetString(5), party = reader.IsDBNull(6) ? "" : reader.GetString(6), narration = reader.IsDBNull(7) ? "" : reader.GetString(7), isCancelled = !reader.IsDBNull(8) && reader.GetInt32(8) != 0, isOptional = !reader.IsDBNull(9) && reader.GetInt32(9) != 0, rawXml = reader.IsDBNull(10) ? "" : reader.GetString(10) });
             else if (table == "entry") rows.Add(new { voucherGuid = reader.GetString(0), lineNo = reader.IsDBNull(1) ? 0 : reader.GetInt32(1), ledgerName = reader.IsDBNull(2) ? "" : reader.GetString(2), amount = reader.IsDBNull(3) ? 0m : reader.GetDecimal(3), isParty = !reader.IsDBNull(4) && reader.GetInt32(4) != 0 });
             else rows.Add(new { tallyGuid = reader.GetString(0), name = reader.GetString(1), booksFrom = reader.IsDBNull(2) ? "" : reader.GetString(2), syncedAt = reader.IsDBNull(3) ? "" : reader.GetString(3) });
@@ -253,6 +309,16 @@ public static class SyncStore
                         ("$cp", creditPeriod), ("$dd", dueDate ?? (object)DBNull.Value));
                     billCount++;
                 }
+            }
+            var items = voucher.Elements().Where(x => x.Name.LocalName.Equals("ALLINVENTORYENTRIES.LIST", StringComparison.OrdinalIgnoreCase) || x.Name.LocalName.Equals("INVENTORYENTRIES.LIST", StringComparison.OrdinalIgnoreCase)).ToArray();
+            foreach (var item in items)
+            {
+                var itemName = Value(item, "STOCKITEMNAME");
+                if (string.IsNullOrWhiteSpace(itemName)) continue;
+                var qty = Value(item, "BILLEDQTY");
+                if (qty.Length == 0) qty = Value(item, "ACTUALQTY");
+                Exec(db, tx, "INSERT INTO inventory(voucher_guid,item,qty,rate,amount,godown) VALUES($g,$i,$q,$r,$a,$gd)",
+                    ("$g", guid), ("$i", itemName), ("$q", qty), ("$r", Value(item, "RATE")), ("$a", Amount(Value(item, "AMOUNT"))), ("$gd", Value(item, "GODOWNNAME")));
             }
             voucherCount++;
         }

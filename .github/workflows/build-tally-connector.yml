@@ -20,5 +20,5 @@ jobs:
       - name: Upload connector artifact
         uses: actions/upload-artifact@v4
         with:
-          name: UniversalTallyConnector-win-x64-v2.15.0
+          name: UniversalTallyConnector-win-x64-v2.16.0
           path: connector-release/UniversalTallyConnector.exe
