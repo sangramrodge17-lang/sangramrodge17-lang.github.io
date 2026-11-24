@@ -7,6 +7,9 @@ on:
       - 'connector/native/**'
       - '.github/workflows/build-tally-connector.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,3 +25,10 @@ jobs:
         with:
           name: UniversalTallyConnector-win-x64-v2.16.0
           path: connector-release/UniversalTallyConnector.exe
+      - name: Publish release for the website download button
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete connector-v2.16.0 --yes --cleanup-tag || true
+          gh release create connector-v2.16.0 connector-release/UniversalTallyConnector.exe --title "Connector v2.16.0" --notes "All-data sync: every master, stock lines, GST/TDS fields, bills, MSME." --target ${{ github.sha }}
