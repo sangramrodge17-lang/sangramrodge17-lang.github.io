@@ -22,12 +22,12 @@ jobs:
       - name: Upload connector artifact
         uses: actions/upload-artifact@v4
         with:
-          name: UniversalTallyConnector-win-x64-v2.16.2
+          name: UniversalTallyConnector-win-x64-v2.16.3
           path: connector-release/UniversalTallyConnector.exe
       - name: Publish connector release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete connector-v2.16.2 --yes --cleanup-tag || true
-          gh release create connector-v2.16.2 connector-release/UniversalTallyConnector.exe --title "Connector v2.16.2" --notes "Legacy-compatible Tally XML request with bounded dated windows, live progress, normalized all-data storage, and backend snapshot ingestion." --target ${{ github.sha }}
+          gh release delete connector-v2.16.3 --yes --cleanup-tag || true
+          gh release create connector-v2.16.3 connector-release/UniversalTallyConnector.exe --title "Connector v2.16.3" --notes "Stable sync path using the proven core Tally XML request; optional enrichment and raw-object capture are disabled by default to prevent Tally port exhaustion, with bounded date windows and live progress." --target ${{ github.sha }}

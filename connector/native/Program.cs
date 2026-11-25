@@ -6,7 +6,7 @@ using System.Xml.Linq;
 
 const int connectorPort = 17891;
 const int defaultTallyPort = 9000;
-const string connectorVersion = "2.16.2-legacy-xml-sync";
+const string connectorVersion = "2.16.3-stable-sync";
 var tallyPort = int.TryParse(Environment.GetEnvironmentVariable("TALLY_PORT"), out var configuredPort)
     ? configuredPort
     : defaultTallyPort;
@@ -41,6 +41,8 @@ using var geminiClient = new HttpClient(geminiHandler)
 var geminiModel = Environment.GetEnvironmentVariable("GEMINI_MODEL") is { Length: > 0 } configuredModel
     ? configuredModel
     : "gemini-3.5-flash-lite";
+var optionalCaptureEnabled = string.Equals(Environment.GetEnvironmentVariable("TALLY_ENABLE_OPTIONAL_CAPTURE"), "1", StringComparison.OrdinalIgnoreCase)
+    || string.Equals(Environment.GetEnvironmentVariable("TALLY_ENABLE_OPTIONAL_CAPTURE"), "true", StringComparison.OrdinalIgnoreCase);
 var syncProgress = new SyncProgressState();
 
 // Command-line modes run without starting the HTTP listener:
@@ -417,17 +419,27 @@ async Task<object> SyncModel3Async(SyncRequest request)
         warnings.Add($"Master synchronization warning: {ex.Message}");
     }
 
-    // Best-effort enrichment (group paths, GST/PAN, MSME/Udyam, opening bills). It must never stop the proven sync below.
-    try
+    // Optional enrichment makes many individual requests to Tally. The older
+    // connector's stable path did not do this, and the attached diagnostics
+    // show Tally stopped accepting port 9000 after only three such requests.
+    // Keep it opt-in so the primary voucher sync remains Tally-compatible.
+    if (optionalCaptureEnabled)
     {
-        var enrichment = await LedgerEnricher.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
-        stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = enrichment.Status, detail = enrichment.Detail, rows = enrichment.Updated });
-        if (enrichment.Warning is not null) warnings.Add(enrichment.Warning);
+        try
+        {
+            var enrichment = await LedgerEnricher.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
+            stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = enrichment.Status, detail = enrichment.Detail, rows = enrichment.Updated });
+            if (enrichment.Warning is not null) warnings.Add(enrichment.Warning);
+        }
+        catch (Exception ex)
+        {
+            stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = "warning", detail = ex.Message, rows = 0 });
+            warnings.Add($"Ledger enrichment warning: {ex.Message}");
+        }
     }
-    catch (Exception ex)
+    else
     {
-        stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = "warning", detail = ex.Message, rows = 0 });
-        warnings.Add($"Ledger enrichment warning: {ex.Message}");
+        stages.Add(new { stage = "Ledger enrichment (groups, GST/PAN, MSME, opening bills)", status = "skipped", detail = "Skipped in safe sync mode; enable TALLY_ENABLE_OPTIONAL_CAPTURE only after the primary voucher sync is stable.", rows = 0 });
     }
 
     // Tally already includes the voucher type on every node. Requesting Sales,
@@ -495,17 +507,25 @@ async Task<object> SyncModel3Async(SyncRequest request)
         }
     }
 
-    // Best-effort raw capture of every master (cost centres, stock items, GST/TDS setup, payroll, ...). Never blocks the sync.
-    try
+    // Raw master capture is also opt-in for the same reason: it can generate
+    // many sequential Tally requests and must not destabilize the core sync.
+    if (optionalCaptureEnabled)
     {
-        var objects = await ObjectCapture.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
-        stages.Add(new { stage = "Master capture (all objects)", status = objects.Status, detail = objects.Detail, rows = objects.Updated });
-        if (objects.Warning is not null) warnings.Add(objects.Warning);
+        try
+        {
+            var objects = await ObjectCapture.RunAsync(xml => PostTallyAsync(xml, Encoding.UTF8, "application/xml"));
+            stages.Add(new { stage = "Master capture (all objects)", status = objects.Status, detail = objects.Detail, rows = objects.Updated });
+            if (objects.Warning is not null) warnings.Add(objects.Warning);
+        }
+        catch (Exception ex)
+        {
+            stages.Add(new { stage = "Master capture (all objects)", status = "warning", detail = ex.Message, rows = 0 });
+            warnings.Add($"Master capture warning: {ex.Message}");
+        }
     }
-    catch (Exception ex)
+    else
     {
-        stages.Add(new { stage = "Master capture (all objects)", status = "warning", detail = ex.Message, rows = 0 });
-        warnings.Add($"Master capture warning: {ex.Message}");
+        stages.Add(new { stage = "Master capture (all objects)", status = "skipped", detail = "Skipped in safe sync mode to protect TallyPrime availability.", rows = 0 });
     }
 
     stages.Add(new { stage = "Reconciliation", status = voucherTotal > 0 ? "complete" : "warning", detail = $"Local normalized store contains {voucherTotal} voucher(s) from this run" });
