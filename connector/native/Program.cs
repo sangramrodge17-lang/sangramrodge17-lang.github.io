@@ -6,7 +6,7 @@ using System.Xml.Linq;
 
 const int connectorPort = 17891;
 const int defaultTallyPort = 9000;
-const string connectorVersion = "2.16.0-all-data-sync";
+const string connectorVersion = "2.16.1-safe-window-sync";
 var tallyPort = int.TryParse(Environment.GetEnvironmentVariable("TALLY_PORT"), out var configuredPort)
     ? configuredPort
     : defaultTallyPort;
@@ -432,59 +432,66 @@ async Task<object> SyncModel3Async(SyncRequest request)
 
     // Tally already includes the voucher type on every node. Requesting Sales,
     // Purchase, Receipt, Payment, Journal and Contra separately duplicates the
-    // full-company export and can wait six times for the same historical data.
-    try
+    // full-company export. For a dated full sync, never send one oversized
+    // request first: retrieve bounded windows directly so TallyPrime remains
+    // responsive and every successful window is committed before continuing.
+    var windows = DateWindows(from, to);
+    var useBoundedWindows = full && windows.Count > 1;
+    if (useBoundedWindows)
     {
-        syncProgress.Update("vouchers", full ? "Requesting the complete voucher collection from TallyPrime" : $"Requesting vouchers from {from} to {to}");
-        var body = await PostTallyAsync(VoucherCollectionXml(string.IsNullOrWhiteSpace(from) ? null : from, string.IsNullOrWhiteSpace(to) ? null : to), Encoding.UTF8, "application/xml");
-        var diagnostics = SyncStore.DescribeResponse(body);
-        if (diagnostics.VoucherNodes + diagnostics.DisplayVoucherNodes > 0)
+        syncProgress.Update("vouchers-chunked", $"Starting safe bounded synchronization in {windows.Count} date windows");
+        for (var windowNumber = 0; windowNumber < windows.Count; windowNumber++)
         {
-            var summary = SyncStore.UpsertVoucherXml(body, company, from, to);
-            voucherTotal += summary.VouchersUpserted;
-            entryTotal += summary.EntriesUpserted;
-            syncProgress.Update("vouchers", $"Stored {summary.VouchersUpserted} voucher(s) from the complete collection", voucherTotal, entryTotal);
-            stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "complete", detail = $"{summary.VouchersUpserted} voucher(s), {summary.EntriesUpserted} entry line(s)", rows = summary.VouchersUpserted });
-        }
-        else
-        {
-            stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "warning", detail = "No voucher nodes returned by the complete collection", rows = 0 });
-            warnings.Add("The complete voucher collection returned no recognised VOUCHER or DSPVOUCHER nodes.");
+            var window = windows[windowNumber];
+            try
+            {
+                syncProgress.Update("vouchers-chunked", $"Retrieving date window {windowNumber + 1}/{windows.Count}: {window.From} to {window.To}", voucherTotal, entryTotal);
+                var windowBody = await PostTallyAsync(VoucherCollectionXml(window.From, window.To), Encoding.UTF8, "application/xml");
+                var windowDiagnostics = SyncStore.DescribeResponse(windowBody);
+                if (windowDiagnostics.VoucherNodes + windowDiagnostics.DisplayVoucherNodes == 0)
+                {
+                    stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "warning", detail = "No voucher nodes returned", rows = 0 });
+                    warnings.Add($"Voucher window {window.From}–{window.To} returned no recognised VOUCHER or DSPVOUCHER nodes.");
+                    continue;
+                }
+                var windowSummary = SyncStore.UpsertVoucherXml(windowBody, company, window.From, window.To);
+                voucherTotal += windowSummary.VouchersUpserted;
+                entryTotal += windowSummary.EntriesUpserted;
+                syncProgress.Update("vouchers-chunked", $"Stored window {windowNumber + 1}/{windows.Count}: {window.From} to {window.To}", voucherTotal, entryTotal);
+                stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "complete", detail = $"{windowSummary.VouchersUpserted} voucher(s), {windowSummary.EntriesUpserted} entry line(s)", rows = windowSummary.VouchersUpserted });
+            }
+            catch (Exception windowError)
+            {
+                stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "failed", detail = windowError.Message, rows = 0 });
+                warnings.Add($"Voucher window {window.From}–{window.To} failed: {windowError.Message}");
+            }
         }
     }
-    catch (Exception ex)
+    else
     {
-        stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "failed", detail = ex.Message, rows = 0 });
-        warnings.Add($"Complete voucher collection failed: {ex.Message}");
-        if (full && DateWindows(from, to).Count > 1)
+        try
         {
-            syncProgress.Update("vouchers-chunked", "The complete export was too large; automatically resuming in bounded date windows");
-            var windowNumber = 0;
-            foreach (var window in DateWindows(from, to))
+            syncProgress.Update("vouchers", full ? "Requesting the complete voucher collection from TallyPrime (no date window supplied)" : $"Requesting vouchers from {from} to {to}");
+            var body = await PostTallyAsync(VoucherCollectionXml(string.IsNullOrWhiteSpace(from) ? null : from, string.IsNullOrWhiteSpace(to) ? null : to), Encoding.UTF8, "application/xml");
+            var diagnostics = SyncStore.DescribeResponse(body);
+            if (diagnostics.VoucherNodes + diagnostics.DisplayVoucherNodes > 0)
             {
-                windowNumber++;
-                try
-                {
-                    syncProgress.Update("vouchers-chunked", $"Retrieving date window {windowNumber}/{DateWindows(from, to).Count}: {window.From} to {window.To}");
-                    var windowBody = await PostTallyAsync(VoucherCollectionXml(window.From, window.To), Encoding.UTF8, "application/xml");
-                    var windowDiagnostics = SyncStore.DescribeResponse(windowBody);
-                    if (windowDiagnostics.VoucherNodes + windowDiagnostics.DisplayVoucherNodes == 0)
-                    {
-                        stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "warning", detail = "No voucher nodes returned", rows = 0 });
-                        continue;
-                    }
-                    var windowSummary = SyncStore.UpsertVoucherXml(windowBody, company, window.From, window.To);
-                    voucherTotal += windowSummary.VouchersUpserted;
-                    entryTotal += windowSummary.EntriesUpserted;
-                    syncProgress.Update("vouchers-chunked", $"Stored window {windowNumber}/{DateWindows(from, to).Count}", voucherTotal, entryTotal);
-                    stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "complete", detail = $"{windowSummary.VouchersUpserted} voucher(s), {windowSummary.EntriesUpserted} entry line(s)", rows = windowSummary.VouchersUpserted });
-                }
-                catch (Exception windowError)
-                {
-                    stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "failed", detail = windowError.Message, rows = 0 });
-                    warnings.Add($"Voucher window {window.From}–{window.To} failed: {windowError.Message}");
-                }
+                var summary = SyncStore.UpsertVoucherXml(body, company, from, to);
+                voucherTotal += summary.VouchersUpserted;
+                entryTotal += summary.EntriesUpserted;
+                syncProgress.Update("vouchers", $"Stored {summary.VouchersUpserted} voucher(s) from the complete collection", voucherTotal, entryTotal);
+                stages.Add(new { stage = "Voucher collection (single pass)", status = "complete", detail = $"{summary.VouchersUpserted} voucher(s), {summary.EntriesUpserted} entry line(s)", rows = summary.VouchersUpserted });
             }
+            else
+            {
+                stages.Add(new { stage = "Voucher collection (single pass)", status = "warning", detail = "No voucher nodes returned by the collection", rows = 0 });
+                warnings.Add("The voucher collection returned no recognised VOUCHER or DSPVOUCHER nodes.");
+            }
+        }
+        catch (Exception ex)
+        {
+            stages.Add(new { stage = "Voucher collection (single pass)", status = "failed", detail = ex.Message, rows = 0 });
+            warnings.Add($"Voucher collection failed: {ex.Message}");
         }
     }
 
