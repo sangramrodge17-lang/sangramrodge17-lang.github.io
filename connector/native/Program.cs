@@ -41,6 +41,7 @@ using var geminiClient = new HttpClient(geminiHandler)
 var geminiModel = Environment.GetEnvironmentVariable("GEMINI_MODEL") is { Length: > 0 } configuredModel
     ? configuredModel
     : "gemini-3.5-flash-lite";
+var syncProgress = new SyncProgressState();
 
 // Command-line modes run without starting the HTTP listener:
 //   --selftest | --capture "<ledger>" [from] [to] | --parse <file.xml> "<ledger>" [openingDrPositive]
@@ -166,7 +167,7 @@ async Task HandleAsync(HttpListenerContext context)
 
     if (path == "/api/sync/model3/status")
     {
-        await JsonAsync(context, 200, new { connected = true, connectorVersion, store = SyncStore.GetStatus(), categories = SyncStore.GetCategoryStatus() });
+        await JsonAsync(context, 200, new { connected = true, connectorVersion, progress = syncProgress.Snapshot(), store = SyncStore.GetStatus(), categories = SyncStore.GetCategoryStatus() });
         return;
     }
 
@@ -363,12 +364,12 @@ async Task<object> GetLedgerBalanceAsync(string? ledger)
 async Task<object> SyncVouchersAsync(SyncRequest request)
 {
     var full = request.Mode.Equals("full", StringComparison.OrdinalIgnoreCase);
-    var from = full ? "" : request.From.Trim();
-    var to = full ? "" : request.To.Trim();
+    var from = request.From.Trim();
+    var to = request.To.Trim();
     // Start with the collection request already proven against this Tally setup.
     // The company is recorded in SQLite; SVCURRENTCOMPANY remains intentionally
     // out of the first sync request until the real company XML is verified.
-    var body = await PostTallyAsync(VoucherCollectionXml(full ? null : from, full ? null : to), Encoding.UTF8, "application/xml");
+    var body = await PostTallyAsync(VoucherCollectionXml(string.IsNullOrWhiteSpace(from) ? null : from, string.IsNullOrWhiteSpace(to) ? null : to), Encoding.UTF8, "application/xml");
     var summary = SyncStore.UpsertVoucherXml(body, request.Company.Trim(), from, to);
     var tallyDiagnostics = SyncStore.DescribeResponse(body);
     return new
@@ -387,12 +388,14 @@ async Task<object> SyncModel3Async(SyncRequest request)
 {
     var company = request.Company.Trim();
     var full = request.Mode.Equals("full", StringComparison.OrdinalIgnoreCase);
-    var from = full ? "" : request.From.Trim();
-    var to = full ? "" : request.To.Trim();
+    var from = request.From.Trim();
+    var to = request.To.Trim();
     var stages = new List<object>();
     var warnings = new List<string>();
     var voucherTotal = 0;
     var entryTotal = 0;
+    syncProgress.Start(company, full ? "full-company" : "period");
+    syncProgress.Update("company-discovery", "Checking the company currently open in TallyPrime");
 
     var discovery = await DiscoverModel3CompanyAsync(company);
     stages.Add(new { stage = "Company discovery", status = discovery.Matched ? "complete" : "warning", detail = discovery.Detail });
@@ -404,6 +407,7 @@ async Task<object> SyncModel3Async(SyncRequest request)
         var ledgerJson = JsonSerializer.SerializeToElement(ledgerResponse);
         var discoveredCount = ledgerJson.TryGetProperty("rows", out var discoveredRows) && discoveredRows.ValueKind == JsonValueKind.Array ? discoveredRows.GetArrayLength() : 0;
         var ledgerCount = SyncStore.UpsertLedgerMasters(discoveredRows, null);
+        syncProgress.Update("masters", $"Staged {ledgerCount} ledger master(s)");
         stages.Add(new { stage = "Master synchronization", status = ledgerCount > 0 ? "complete" : "warning", detail = $"{ledgerCount} of {discoveredCount} ledger master(s) staged locally", rows = ledgerCount });
         if (ledgerCount == 0) warnings.Add("Tally returned no ledger masters during Model 3 discovery.");
     }
@@ -426,43 +430,61 @@ async Task<object> SyncModel3Async(SyncRequest request)
         warnings.Add($"Ledger enrichment warning: {ex.Message}");
     }
 
-    foreach (var category in new[] { "Sales", "Purchase", "Receipt", "Payment", "Journal", "Contra" })
+    // Tally already includes the voucher type on every node. Requesting Sales,
+    // Purchase, Receipt, Payment, Journal and Contra separately duplicates the
+    // full-company export and can wait six times for the same historical data.
+    try
     {
-        try
+        syncProgress.Update("vouchers", full ? "Requesting the complete voucher collection from TallyPrime" : $"Requesting vouchers from {from} to {to}");
+        var body = await PostTallyAsync(VoucherCollectionXml(string.IsNullOrWhiteSpace(from) ? null : from, string.IsNullOrWhiteSpace(to) ? null : to), Encoding.UTF8, "application/xml");
+        var diagnostics = SyncStore.DescribeResponse(body);
+        if (diagnostics.VoucherNodes + diagnostics.DisplayVoucherNodes > 0)
         {
-            var body = await PostTallyAsync(VoucherCollectionXml(full ? null : from, full ? null : to, category), Encoding.UTF8, "application/xml");
-            var diagnostics = SyncStore.DescribeResponse(body);
-            if (diagnostics.VoucherNodes + diagnostics.DisplayVoucherNodes > 0)
-            {
-                var summary = SyncStore.UpsertVoucherXml(body, company, from, to);
-                voucherTotal += summary.VouchersUpserted;
-                entryTotal += summary.EntriesUpserted;
-                stages.Add(new { stage = $"Voucher category: {category}", status = "complete", detail = $"{summary.VouchersUpserted} voucher(s), {summary.EntriesUpserted} entry line(s)", rows = summary.VouchersUpserted });
-            }
-            else stages.Add(new { stage = $"Voucher category: {category}", status = "warning", detail = "No voucher nodes returned by the category filter", rows = 0 });
-        }
-        catch (Exception ex)
-        {
-            stages.Add(new { stage = $"Voucher category: {category}", status = "warning", detail = ex.Message, rows = 0 });
-            warnings.Add($"{category} category request failed: {ex.Message}");
-        }
-    }
-
-    if (voucherTotal == 0)
-    {
-        try
-        {
-            var body = await PostTallyAsync(VoucherCollectionXml(full ? null : from, full ? null : to), Encoding.UTF8, "application/xml");
             var summary = SyncStore.UpsertVoucherXml(body, company, from, to);
             voucherTotal += summary.VouchersUpserted;
             entryTotal += summary.EntriesUpserted;
-            stages.Add(new { stage = "Voucher fallback collection", status = summary.VouchersUpserted > 0 ? "complete" : "warning", detail = $"{summary.VouchersUpserted} voucher(s) returned after category fallback", rows = summary.VouchersUpserted });
-            if (summary.VouchersUpserted == 0) warnings.Add("The broad voucher collection also returned no recognised VOUCHER or DSPVOUCHER nodes.");
+            syncProgress.Update("vouchers", $"Stored {summary.VouchersUpserted} voucher(s) from the complete collection", voucherTotal, entryTotal);
+            stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "complete", detail = $"{summary.VouchersUpserted} voucher(s), {summary.EntriesUpserted} entry line(s)", rows = summary.VouchersUpserted });
         }
-        catch (Exception ex)
+        else
         {
-            stages.Add(new { stage = "Voucher fallback collection", status = "failed", detail = ex.Message, rows = 0 });
-            warnings.Add($"Broad voucher collection failed: {ex.Message}");
+            stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "warning", detail = "No voucher nodes returned by the complete collection", rows = 0 });
+            warnings.Add("The complete voucher collection returned no recognised VOUCHER or DSPVOUCHER nodes.");
+        }
+    }
+    catch (Exception ex)
+    {
+        stages.Add(new { stage = "Voucher collection (complete, single pass)", status = "failed", detail = ex.Message, rows = 0 });
+        warnings.Add($"Complete voucher collection failed: {ex.Message}");
+        if (full && DateWindows(from, to).Count > 1)
+        {
+            syncProgress.Update("vouchers-chunked", "The complete export was too large; automatically resuming in bounded date windows");
+            var windowNumber = 0;
+            foreach (var window in DateWindows(from, to))
+            {
+                windowNumber++;
+                try
+                {
+                    syncProgress.Update("vouchers-chunked", $"Retrieving date window {windowNumber}/{DateWindows(from, to).Count}: {window.From} to {window.To}");
+                    var windowBody = await PostTallyAsync(VoucherCollectionXml(window.From, window.To), Encoding.UTF8, "application/xml");
+                    var windowDiagnostics = SyncStore.DescribeResponse(windowBody);
+                    if (windowDiagnostics.VoucherNodes + windowDiagnostics.DisplayVoucherNodes == 0)
+                    {
+                        stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "warning", detail = "No voucher nodes returned", rows = 0 });
+                        continue;
+                    }
+                    var windowSummary = SyncStore.UpsertVoucherXml(windowBody, company, window.From, window.To);
+                    voucherTotal += windowSummary.VouchersUpserted;
+                    entryTotal += windowSummary.EntriesUpserted;
+                    syncProgress.Update("vouchers-chunked", $"Stored window {windowNumber}/{DateWindows(from, to).Count}", voucherTotal, entryTotal);
+                    stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "complete", detail = $"{windowSummary.VouchersUpserted} voucher(s), {windowSummary.EntriesUpserted} entry line(s)", rows = windowSummary.VouchersUpserted });
+                }
+                catch (Exception windowError)
+                {
+                    stages.Add(new { stage = $"Voucher window {window.From}–{window.To}", status = "failed", detail = windowError.Message, rows = 0 });
+                    warnings.Add($"Voucher window {window.From}–{window.To} failed: {windowError.Message}");
+                }
+            }
         }
     }
 
@@ -480,6 +502,7 @@ async Task<object> SyncModel3Async(SyncRequest request)
     }
 
     stages.Add(new { stage = "Reconciliation", status = voucherTotal > 0 ? "complete" : "warning", detail = $"Local normalized store contains {voucherTotal} voucher(s) from this run" });
+    syncProgress.Complete($"Synchronization completed with {voucherTotal} voucher(s) and {entryTotal} entry line(s)");
     var store = SyncStore.GetStatus();
     return new
     {
@@ -1412,11 +1435,96 @@ static async Task JsonAsync(HttpListenerContext context, int status, object valu
     context.Response.Close();
 }
 
+static List<(string From, string To)> DateWindows(string from, string to)
+{
+    if (!DateTime.TryParseExact(from, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var start) ||
+        !DateTime.TryParseExact(to, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var end) || start > end)
+        return new List<(string From, string To)> { (from, to) };
+    var windows = new List<(string From, string To)>();
+    var cursor = start;
+    while (cursor <= end)
+    {
+        var windowEnd = cursor.AddMonths(3).AddDays(-1);
+        if (windowEnd > end) windowEnd = end;
+        windows.Add((cursor.ToString("yyyyMMdd"), windowEnd.ToString("yyyyMMdd")));
+        cursor = windowEnd.AddDays(1);
+    }
+    return windows;
+}
+
 record XmlProfile(string MediaType, Encoding Encoding, string Payload);
 record LedgerWriteRequest(string Action, string Name, string? Parent, string? OpeningBalance, bool Confirm = false);
 record ImportRequest(string Xml, bool Confirm = false);
 record AiAnswerRequest(string Question, string Intent, string LedgerName, string FromDate, string ToDate, string RequestedFormat, double Confidence, JsonElement Data, string ApiKey);
 record AiPlanRequest(string Question, List<string> AvailableLedgers, string ApiKey);
-
 record LedgerBatchRequest(string[] Ledgers, string? From = null, string? To = null);
 record SyncRequest(string Company, string From = "", string To = "", string Mode = "period");
+
+sealed class SyncProgressState
+{
+    private readonly object gate = new();
+    private string status = "idle";
+    private string stage = "idle";
+    private string detail = "";
+    private string company = "";
+    private int vouchers;
+    private int entries;
+    private DateTimeOffset startedAt;
+    private DateTimeOffset updatedAt;
+
+    public void Start(string requestedCompany, string mode)
+    {
+        lock (gate)
+        {
+            status = "running";
+            stage = "company-discovery";
+            detail = $"Starting {mode} synchronization";
+            company = requestedCompany;
+            vouchers = 0;
+            entries = 0;
+            startedAt = updatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void Update(string nextStage, string nextDetail, int? voucherCount = null, int? entryCount = null)
+    {
+        lock (gate)
+        {
+            stage = nextStage;
+            detail = nextDetail;
+            if (voucherCount is not null) vouchers = voucherCount.Value;
+            if (entryCount is not null) entries = entryCount.Value;
+            updatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void Complete(string completionDetail)
+    {
+        lock (gate)
+        {
+            status = "complete";
+            stage = "complete";
+            detail = completionDetail;
+            updatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void Fail(string error)
+    {
+        lock (gate)
+        {
+            status = "error";
+            stage = "error";
+            detail = error;
+            updatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    public object Snapshot()
+    {
+        lock (gate)
+        {
+            return new { status, stage, detail, company, vouchers, entries, startedAt, updatedAt, elapsedSeconds = startedAt == default ? 0 : (int)(DateTimeOffset.UtcNow - startedAt).TotalSeconds };
+        }
+    }
+}
